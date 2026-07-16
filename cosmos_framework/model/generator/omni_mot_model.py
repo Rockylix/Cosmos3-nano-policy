@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
@@ -16,38 +17,8 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
-from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.data.generator.action.action_processing import ActionProcessor, get_action_processing_records
-from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
-from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
-from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
-from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
-from cosmos_framework.model.generator.diffusion.samplers.unipc import UniPCSampler, UniPCSamplerConfig
-from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_broadcast_tensor_list
-from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
-from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
-from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
-from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
-from cosmos_framework.model.generator.utils.data_and_condition import (
-    GenerationDataClean,
-    GenerationDataNoised,
-    _expand_per_sample_to_per_vision_item,
-    build_dense_sound_schedule,
-    unwrap_and_densify,
-)
-from cosmos_framework.model.generator.utils.memory import MemoryState
-from cosmos_framework.model.generator.utils.safetensors_loader import (
-    load_language_model as load_language_model_safetensors,
-)
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
     SequencePlan,
@@ -55,12 +26,43 @@ from cosmos_framework.data.generator.sequence_packing import (
     pack_input_sequence,
 )
 from cosmos_framework.data.generator.sequence_packing.modalities import add_special_tokens
+from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
+from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
+from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
+from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
+from cosmos_framework.model.generator.diffusion.samplers.unipc import UniPCSampler, UniPCSamplerConfig
+from cosmos_framework.model.generator.mot.attention import dispatch_attention_with_memory
+from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_broadcast_tensor_list
+from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
+from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
+from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
+from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.model.generator.utils.data_and_condition import (
+    GenerationDataClean,
+    GenerationDataNoised,
+    _expand_per_sample_to_per_vision_item,
+    build_dense_sound_schedule,
+    unwrap_and_densify,
+)
+from cosmos_framework.model.generator.utils.memory import DiffusionKVCacheMemoryState, MemoryState
+from cosmos_framework.model.generator.utils.safetensors_loader import (
+    load_language_model as load_language_model_safetensors,
+)
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.timer import Timer
 
 
 class OmniMoTModel(ImaginaireModel):
@@ -72,6 +74,7 @@ class OmniMoTModel(ImaginaireModel):
     def __init__(self, config: OmniMoTModelConfig):
         super().__init__()
         self.config = config
+        self._reasoner_offload_complete = False
         log.info(f"OmniMoTModel: config {self.config}")
 
         # 0. Set up precision
@@ -172,7 +175,6 @@ class OmniMoTModel(ImaginaireModel):
         else:
             self.tokenizer_sound_gen = None
 
-
     def build_net(self, dtype: torch.dtype, *, lora_enabled: bool | None = None) -> torch.nn.Module:
         # Build model network and parallelize it.
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
@@ -230,6 +232,19 @@ class OmniMoTModel(ImaginaireModel):
 
         self.install_attention_dispatch(net)
 
+        # ---- Layer-wise CPU offload anchor (4090 24GB; env COSMOS3_LAYER_OFFLOAD) ----
+        # The DiT (~23 GB BF16) does not fit on a single 4090 next to VAE/activations.
+        # When enabled: (1) run EAGER (disable torch.compile — moving a compiled
+        # block's weights device between calls would force retrace); (2) materialize
+        # on CPU; (3) pin the small non-layer parts to GPU and stream the 36
+        # transformer layers per-step (see the block loop in unified_mot.py).
+        _layer_offload = _env_enabled("COSMOS3_LAYER_OFFLOAD") or self._reasoner_offload_enabled()
+        if _layer_offload:
+            try:
+                self.config.compile.enabled = False
+            except Exception:
+                pass  # frozen config — apply_compile is still gated on .enabled
+
         net = parallelize_vfm_network(
             net,
             parallel_dims=self.parallel_dims,
@@ -238,16 +253,30 @@ class OmniMoTModel(ImaginaireModel):
             attention_io_layout=self.config.parallelism.attention_io_layout,
         )
 
+        _build_device = "cpu" if _layer_offload else DEVICE
         with misc.timer("meta to cuda and broadcast model states"):
             net = net.to(dtype=dtype)
-            net.to_empty(device=DEVICE)
+            net.to_empty(device=_build_device)
+            if _layer_offload:
+                # Establish the mixed-device empty storage before init_weights
+                # writes any parameter pages.  In reasoner-offload mode this
+                # means GEN is initialized directly on CUDA instead of first
+                # committing a 12.94 GiB CPU copy and moving it afterwards.
+                self._place_initial_offload_towers(net, allocate_empty=True, log_result=False)
             if DEVICE == Device.CUDA:
                 # Weight initialization is not needed for other devices (cpu,
                 # meta), since they are only for checkpoint conversion and smoke
                 # tests.
-                net.init_weights(buffer_device=DEVICE)
+                net.init_weights(buffer_device=_build_device)
                 if lora_enabled:
                     self._init_lora_weights_post_materialization(net)
+
+        if _layer_offload:
+            # init_weights may recreate a small number of buffers on
+            # ``buffer_device``. Re-apply placement after initialization; the
+            # large parameters are already on their final devices, so this
+            # correction does not copy either tower.
+            self._place_initial_offload_towers(net, allocate_empty=False, log_result=True)
 
         return net
 
@@ -376,17 +405,25 @@ class OmniMoTModel(ImaginaireModel):
         """Install a custom attention dispatch function on the network.
 
         Called during ``build_net()`` after the network is constructed but
-        before parallelization.  The base implementation is a no-op;
-        ``OmniMoTCausalModel`` overrides this to install
-        ``dispatch_attention_with_memory`` on every attention layer.
+        before parallelization.  The base implementation keeps historical
+        behavior unless the diffusion KV-cache env is enabled.
         """
-        pass
+        if self._diffusion_kv_cache_enabled():
+            self._install_attention_dispatch_with_memory(net)
+
+    def _install_attention_dispatch_with_memory(self, net: torch.nn.Module) -> None:
+        installed = 0
+        for module in net.modules():
+            if hasattr(module, "dispatch_attention_fn"):
+                module.dispatch_attention_fn = dispatch_attention_with_memory
+                installed += 1
+        log.info(f"{type(self).__name__}: installed memory-aware attention dispatch on {installed} modules")
 
     def set_up_memory(self) -> None:
         """Initialize memory state used during training (e.g. KV caches).
 
-        The base implementation is a no-op.  ``OmniMoTCausalModel`` overrides
-        this to allocate a KV cache.
+        The base implementation is a no-op; diffusion inference KV-cache state
+        is created per sampling branch by ``build_inference_memory_state``.
         """
         pass
 
@@ -664,6 +701,254 @@ class OmniMoTModel(ImaginaireModel):
                 caller.  See ``memory_init_training()`` for the base keys.
         """
         return None
+
+    def build_inference_memory_state(self, net: torch.nn.Module | None = None) -> MemoryState | None:
+        """Construct persistent memory for one inference branch.
+
+        The base model keeps historical no-memory behavior unless
+        ``COSMOS3_REASONER_KVCACHE`` or ``COSMOS3_REASONER_OFFLOAD`` is set.
+        """
+        if not self._diffusion_kv_cache_enabled():
+            return None
+        return DiffusionKVCacheMemoryState(num_layers=self._num_decoder_layers(net))
+
+    def _diffusion_kv_cache_enabled(self) -> bool:
+        return _env_enabled("COSMOS3_REASONER_KVCACHE") or _env_enabled("COSMOS3_REASONER_OFFLOAD")
+
+    def _reasoner_offload_enabled(self) -> bool:
+        return _env_enabled("COSMOS3_REASONER_OFFLOAD")
+
+    def _place_initial_offload_towers(
+        self,
+        net: torch.nn.Module,
+        *,
+        allocate_empty: bool = False,
+        log_result: bool = True,
+    ) -> None:
+        """Materialize the inference tower split before checkpoint loading.
+
+        Generic layerwise offload keeps the full transformer stack on CPU. In
+        reasoner-offload mode, GEN is instead resident on CUDA from model
+        construction onward while only the UND layer path is streamed. DCP
+        loading then writes directly into this mixed-device destination.
+
+        When ``allocate_empty`` is true, tensors that belong on the inference
+        device receive fresh empty storage instead of copying their current
+        contents. This mode is used immediately after ``to_empty(cpu)`` and
+        before ``init_weights`` so uninitialized GEN pages are never read or
+        committed in host RAM.
+        """
+
+        try:
+            layers = net.get_submodule("language_model.model.layers")
+        except AttributeError:
+            return
+
+        cuda_device = torch.device(DEVICE)
+        layer_parameters = {id(parameter) for parameter in layers.parameters()}
+        layer_buffers = {id(buffer) for buffer in layers.buffers()}
+        reasoner_offload = self._reasoner_offload_enabled()
+        generator_resident_cuda = 0
+        generator_total = 0
+
+        def _move_tensor(tensor: torch.Tensor) -> None:
+            if tensor.device.type == cuda_device.type and (
+                cuda_device.index is None or tensor.device.index == cuda_device.index
+            ):
+                return
+            if allocate_empty:
+                tensor.data = torch.empty_like(tensor, device=cuda_device)
+            else:
+                tensor.data = tensor.data.to(cuda_device, non_blocking=True)
+
+        for name, parameter in net.named_parameters():
+            is_generator = self._reasoner_generator_parameter_target(name) == "cuda"
+            should_reside = id(parameter) not in layer_parameters or (reasoner_offload and is_generator)
+            if should_reside:
+                _move_tensor(parameter)
+            if is_generator:
+                size = parameter.numel() * parameter.element_size()
+                generator_total += size
+                if parameter.device.type == "cuda":
+                    generator_resident_cuda += size
+
+        for name, buffer in net.named_buffers():
+            is_generator = self._reasoner_generator_parameter_target(name) == "cuda"
+            should_reside = id(buffer) not in layer_buffers or (reasoner_offload and is_generator)
+            if should_reside:
+                _move_tensor(buffer)
+            if is_generator:
+                size = buffer.numel() * buffer.element_size()
+                generator_total += size
+                if buffer.device.type == "cuda":
+                    generator_resident_cuda += size
+
+        if log_result and cuda_device.type == "cuda":
+            torch.cuda.synchronize()
+        if log_result:
+            log.info(
+                "OmniMoTModel: initial offload placement complete; "
+                f"generator_resident_cuda={generator_resident_cuda / (1024**3):.2f}/"
+                f"{generator_total / (1024**3):.2f} GiB "
+                "cold_materialization=direct_mixed_device"
+            )
+
+    @staticmethod
+    def _reasoner_generator_parameter_target(name: str) -> str | None:
+        """Classify language-model tensors by UND/GEN ownership.
+
+        ``cpu`` identifies UND-owned tensors, but only UND tensors inside a
+        decoder layer are actually offloaded.  Non-layer UND bridge modules
+        stay CUDA-resident across chunks to avoid redundant transfers.
+        """
+
+        layer_prefix = "language_model.model.layers."
+        if name.startswith(layer_prefix):
+            return "cuda" if "_moe_gen" in name else "cpu"
+        reasoner_prefixes = (
+            "language_model.model.embed_tokens.",
+            "language_model.model.norm.",
+            "language_model.lm_head.",
+            "language_model.visual.",
+        )
+        if name.startswith(reasoner_prefixes):
+            return "cpu"
+        return None
+
+    def _offload_reasoner_and_pin_generator(self, net: torch.nn.Module | None = None) -> None:
+        """Keep GEN and reasoner bridge modules resident; offload UND layer tensors."""
+
+        if self._reasoner_offload_complete:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+            raise NotImplementedError("COSMOS3_REASONER_OFFLOAD currently supports single-rank inference only.")
+
+        target = net or self.net
+        cuda_device = torch.device(DEVICE)
+        cpu_device = torch.device("cpu")
+        moved_to_cpu = 0
+        moved_to_cuda = 0
+
+        def _move_tensor(tensor: torch.Tensor, device: torch.device) -> int:
+            same_device = tensor.device.type == device.type and (
+                device.index is None or tensor.device.index == device.index
+            )
+            if same_device:
+                return 0
+            size = tensor.numel() * tensor.element_size()
+            tensor.data = tensor.data.to(device=device, non_blocking=True)
+            return size
+
+        # UND layer tensors should already be back on CPU after streamed
+        # prefill.  Keep the 2.32 GiB non-layer reasoner bridge (embeddings,
+        # visual encoder, final norm/head) on CUDA: every action chunk needs
+        # it for prefill, and evicting/restoring it adds host pressure and a
+        # redundant D2H/H2D cycle without reducing prefill's CUDA peak.
+        layer_prefix = "language_model.model.layers."
+        for name, parameter in target.named_parameters():
+            if name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu":
+                moved_to_cpu += _move_tensor(parameter, cpu_device)
+        for name, buffer in target.named_buffers():
+            if name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu":
+                moved_to_cpu += _move_tensor(buffer, cpu_device)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        for name, parameter in target.named_parameters():
+            if self._reasoner_generator_parameter_target(name) == "cuda":
+                moved_to_cuda += _move_tensor(parameter, cuda_device)
+        for name, buffer in target.named_buffers():
+            if self._reasoner_generator_parameter_target(name) == "cuda":
+                moved_to_cuda += _move_tensor(buffer, cuda_device)
+        torch.cuda.synchronize()
+        self._reasoner_offload_complete = True
+        generator_resident_cuda = 0
+        for name, parameter in target.named_parameters():
+            if self._reasoner_generator_parameter_target(name) == "cuda" and parameter.device.type == "cuda":
+                generator_resident_cuda += parameter.numel() * parameter.element_size()
+        for name, buffer in target.named_buffers():
+            if self._reasoner_generator_parameter_target(name) == "cuda" and buffer.device.type == "cuda":
+                generator_resident_cuda += buffer.numel() * buffer.element_size()
+        allocated_gib = torch.cuda.memory_allocated() / (1024**3)
+        reserved_gib = torch.cuda.memory_reserved() / (1024**3)
+        log.info(
+            "OmniMoTModel: UND layer offload finalized after prefill; "
+            f"moved_to_cpu={moved_to_cpu / (1024**3):.2f} GiB "
+            f"generator_to_cuda={moved_to_cuda / (1024**3):.2f} GiB "
+            f"generator_resident_cuda={generator_resident_cuda / (1024**3):.2f} GiB "
+            f"cuda_allocated={allocated_gib:.2f} GiB cuda_reserved={reserved_gib:.2f} GiB"
+        )
+
+    def _prepare_reasoner_prefill(self, net: torch.nn.Module | None = None) -> None:
+        """Prepare a new chunk while leaving an already-resident generator on CUDA."""
+
+        if not self._reasoner_offload_enabled():
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+            raise NotImplementedError("COSMOS3_REASONER_OFFLOAD currently supports single-rank inference only.")
+        target = net or self.net
+        cuda_device = torch.device(DEVICE)
+        reasoner_bridge_total = 0
+        reasoner_bridge_cuda = 0
+        layer_prefix = "language_model.model.layers."
+        for name, parameter in target.named_parameters():
+            if self._reasoner_generator_parameter_target(name) == "cpu" and not name.startswith(layer_prefix):
+                size = parameter.numel() * parameter.element_size()
+                reasoner_bridge_total += size
+                if parameter.device.type == cuda_device.type:
+                    reasoner_bridge_cuda += size
+        for name, buffer in target.named_buffers():
+            if self._reasoner_generator_parameter_target(name) == "cpu" and not name.startswith(layer_prefix):
+                size = buffer.numel() * buffer.element_size()
+                reasoner_bridge_total += size
+                if buffer.device.type == cuda_device.type:
+                    reasoner_bridge_cuda += size
+        if reasoner_bridge_cuda != reasoner_bridge_total:
+            raise RuntimeError(
+                "Reasoner bridge modules must remain CUDA-resident between action chunks: "
+                f"{reasoner_bridge_cuda / (1024**3):.2f}/{reasoner_bridge_total / (1024**3):.2f} GiB on CUDA"
+            )
+
+        generator_total = 0
+        generator_remained_cuda = 0
+        for name, parameter in target.named_parameters():
+            if self._reasoner_generator_parameter_target(name) == "cuda":
+                size = parameter.numel() * parameter.element_size()
+                generator_total += size
+                if parameter.device.type == "cuda":
+                    generator_remained_cuda += size
+        for name, buffer in target.named_buffers():
+            if self._reasoner_generator_parameter_target(name) == "cuda":
+                size = buffer.numel() * buffer.element_size()
+                generator_total += size
+                if buffer.device.type == "cuda":
+                    generator_remained_cuda += size
+
+        self._reasoner_offload_complete = False
+        log.info(
+            "OmniMoTModel: prepared reasoner prefill for new chunk; "
+            f"generator_remained_cuda={generator_remained_cuda / (1024**3):.2f}/"
+            f"{generator_total / (1024**3):.2f} GiB "
+            f"reasoner_bridge_remained_cuda={reasoner_bridge_cuda / (1024**3):.2f}/"
+            f"{reasoner_bridge_total / (1024**3):.2f} GiB"
+        )
+
+    def _maybe_finalize_reasoner_offload(
+        self,
+        *,
+        net: torch.nn.Module | None,
+        memories: list[MemoryState | None],
+    ) -> None:
+        if not self._reasoner_offload_enabled() or self._reasoner_offload_complete:
+            return
+        if not memories or any(memory is None or not memory.is_gen_only() for memory in memories):
+            return
+        self._offload_reasoner_and_pin_generator(net)
+
+    def _num_decoder_layers(self, net: torch.nn.Module | None = None) -> int:
+        target = net or self.net
+        layers = target.get_submodule("language_model.model.layers")
+        return len(layers)
 
     def pre_noise_memory_hook(
         self,
@@ -1875,6 +2160,8 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans: list[SequencePlan],
         gen_data_clean: GenerationDataClean,
         skip_text_tokens: bool = False,
+        memory: MemoryState | None = None,
+        und_only: bool = False,
     ) -> list[torch.Tensor]:
         """
         Compute velocity prediction for a single sampling step.
@@ -1895,6 +2182,7 @@ class OmniMoTModel(ImaginaireModel):
             sequence_plans: Pre-computed sequence plans (from _prepare_inference_data)
             gen_data_clean: Pre-computed clean data (from _prepare_inference_data)
             skip_text_tokens: If True, skip text tokens (for CFG unconditional branch)
+            und_only: Populate the understanding K/V cache without computing velocity.
 
         Returns:
             Stacked flattened velocity tensors (one per sample), each containing
@@ -1998,7 +2286,13 @@ class OmniMoTModel(ImaginaireModel):
         out = self.denoise(
             net=net,
             data_batch_packed=packed_sequence,
+            memory=memory,
+            und_only=und_only,
         )
+        if und_only:
+            if memory is None or not memory.is_gen_only():
+                raise RuntimeError("und_only prefill did not populate every diffusion cache layer.")
+            return []
 
         # --- Apply velocity masks ---
         # Zero out velocity for conditioned parts (they don't change during sampling)
@@ -2421,6 +2715,15 @@ class OmniMoTModel(ImaginaireModel):
             _dp_shard_group = None
             _align_device = None
 
+        # A previous request may have offloaded the reasoner tower after its
+        # diffusion prefill. Restore the non-layer reasoner tensors once here;
+        # streamed decoder layers are restored immediately before each layer
+        # runs and selectively evicted again by UnifiedMoT.
+        self._prepare_reasoner_prefill(net)
+
+        cond_memory = self.build_inference_memory_state(net=net)
+        uncond_memory = self.build_inference_memory_state(net=net)
+
         def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
             # len(noise_x) == B, noise_x[i] is shape (D)
             # timestep is shape (B, 1)
@@ -2432,7 +2735,12 @@ class OmniMoTModel(ImaginaireModel):
             # Expand timestep to (B, 1)
             timestep = timestep.repeat(len(noise_x), 1)
 
-            def _single_velocity_fn(tokens: list[list[int]], skip_text_tokens: bool):
+            def _single_velocity_fn(
+                tokens: list[list[int]],
+                skip_text_tokens: bool,
+                memory: MemoryState | None = None,
+                und_only: bool = False,
+            ):
                 return self._get_velocity(
                     net=net,
                     noise_x=noise_x,
@@ -2441,6 +2749,8 @@ class OmniMoTModel(ImaginaireModel):
                     sequence_plans=sequence_plans,
                     gen_data_clean=gen_data_clean,
                     skip_text_tokens=skip_text_tokens,
+                    memory=memory,
+                    und_only=und_only,
                 )
 
             needs_text_cfg = guidance != 1.0
@@ -2448,6 +2758,31 @@ class OmniMoTModel(ImaginaireModel):
                 assert len(guidance_interval) == 2, f"guidance_interval must be [lo, hi], got {guidance_interval}"
                 t_lo, t_hi = guidance_interval
                 needs_text_cfg = t_lo < timestep[0].item() < t_hi
+
+            # Split prefill from denoising exactly as the decoupled Cosmos3
+            # architecture does: UND runs once to populate per-layer K/V, then
+            # step 0 and every later sampler step run GEN-only.  Interval CFG
+            # still prefills the unconditional cache now because it may be
+            # needed by a later timestep after the reasoner has been evicted.
+            prefill_memories: list[MemoryState | None] = []
+            if cond_memory is not None and not cond_memory.is_gen_only():
+                _single_velocity_fn(
+                    cond_tokens,
+                    skip_text_tokens=False,
+                    memory=cond_memory,
+                    und_only=True,
+                )
+                prefill_memories.append(cond_memory)
+            if guidance != 1.0 and uncond_memory is not None and not uncond_memory.is_gen_only():
+                _single_velocity_fn(
+                    uncond_tokens,
+                    skip_text_tokens=skip_text_tokens_for_cfg,
+                    memory=uncond_memory,
+                    und_only=True,
+                )
+                prefill_memories.append(uncond_memory)
+            if prefill_memories:
+                self._maybe_finalize_reasoner_offload(net=net, memories=prefill_memories)
 
             # FSDP alignment: if ANY rank in the shard group needs text-CFG
             # this call, every rank must take the CFG path so the allgather
@@ -2459,9 +2794,23 @@ class OmniMoTModel(ImaginaireModel):
             else:
                 _any_needs_text_cfg = needs_text_cfg
 
+            def _finish_velocity(
+                result: list[torch.Tensor],
+                *,
+                used_uncond: bool,
+            ) -> list[torch.Tensor]:
+                memories = [cond_memory]
+                if used_uncond:
+                    memories.append(uncond_memory)
+                self._maybe_finalize_reasoner_offload(net=net, memories=memories)
+                return result
+
             # Fast path: no text-CFG anywhere and no postprocess hook — single forward.
             if not _any_needs_text_cfg and velocity_postprocess is None:
-                return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+                return _finish_velocity(
+                    _single_velocity_fn(cond_tokens, skip_text_tokens=False, memory=cond_memory),
+                    used_uncond=False,
+                )
 
             # Fast path: only text-CFG and no postprocess — preserve the
             # cfgp-parallel branch so two-rank CFG parallelism stays available.
@@ -2470,29 +2819,37 @@ class OmniMoTModel(ImaginaireModel):
                     cond_tokens=cond_tokens,
                     uncond_tokens=uncond_tokens,
                     skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
-                    single_velocity_fn=_single_velocity_fn,
+                    single_velocity_fn=lambda tokens, skip_text_tokens: _single_velocity_fn(
+                        tokens,
+                        skip_text_tokens,
+                        memory=cond_memory if tokens is cond_tokens else uncond_memory,
+                    ),
                 )
                 if not needs_text_cfg:
                     # Peers needed CFG so we ran the uncond forward to keep
                     # FSDP allgather aligned; locally we still return cond.
-                    return cond_v
+                    return _finish_velocity(cond_v, used_uncond=True)
                 v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
                 if normalize_cfg:
                     v_pred = [
                         v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
                         for v_i, c_i in zip(v_pred, cond_v)
                     ]
-                return v_pred
+                return _finish_velocity(v_pred, used_uncond=True)
 
             # Conditional forward, then per-step postprocess hook. Hook runs
             # sequentially; cfgp parallelism not used on this path.
-            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+            cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False, memory=cond_memory)
             cond_v = velocity_postprocess(cond_v_full, noise_x, timestep)
 
-            uncond_v = _single_velocity_fn(uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg)
+            uncond_v = _single_velocity_fn(
+                uncond_tokens,
+                skip_text_tokens=skip_text_tokens_for_cfg,
+                memory=uncond_memory,
+            )
             if not needs_text_cfg:
                 # Same alignment story as above for the postprocess branch.
-                return cond_v
+                return _finish_velocity(cond_v, used_uncond=True)
 
             v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
 
@@ -2502,7 +2859,7 @@ class OmniMoTModel(ImaginaireModel):
                     for v_i, c_i in zip(v_pred, cond_v)
                 ]
 
-            return v_pred
+            return _finish_velocity(v_pred, used_uncond=True)
 
         # Run sampler for all samples at once.
         sampler = sampler or self.sampler
@@ -3795,6 +4152,7 @@ class OmniMoTModel(ImaginaireModel):
         net: torch.nn.Module | None = None,
         data_batch_packed: PackedSequence | None = None,
         memory: MemoryState | None = None,
+        und_only: bool = False,
     ) -> dict:
         """
         Runs the MoT network on a packed multi-modal sequence to predict velocity (v) targets.
@@ -3803,6 +4161,7 @@ class OmniMoTModel(ImaginaireModel):
             data_batch_packed: PackedSequence from `pack_input_sequence(...)`.
             memory: Optional pre-built MemoryState for autoregressive generation
                 or KV-cache training.
+            und_only: Populate reasoner K/V without decoding generation outputs.
 
         Returns:
             dict containing:
@@ -3816,7 +4175,10 @@ class OmniMoTModel(ImaginaireModel):
         out_net = net(
             packed_seq=data_batch_packed,
             memory=memory,
+            und_only=und_only,
         )
+        if und_only:
+            return out_net
         output_dict = dict()
         output_dict["preds_vision"] = out_net["preds_vision"]
         if self.config.action_gen and "preds_action" in out_net:
@@ -4729,3 +5091,25 @@ def _is_reasoner_state_dict_key(key: str) -> bool:
     if not key.startswith("language_model."):
         return False
     return "_moe_gen" not in key
+
+
+def _env_enabled(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+class OmniMoTCausalModel(OmniMoTModel):
+    """OmniMoT inference variant with diffusion-step und K/V reuse."""
+
+    def install_attention_dispatch(self, net: torch.nn.Module) -> None:
+        self._install_attention_dispatch_with_memory(net)
+
+    def build_memory_state(
+        self,
+        packed_seq: PackedSequence,
+        memory_info: dict,
+    ) -> MemoryState | None:
+        del packed_seq
+        if not memory_info.get("diffusion_kv_cache", False):
+            return None
+        return DiffusionKVCacheMemoryState(num_layers=self._num_decoder_layers())

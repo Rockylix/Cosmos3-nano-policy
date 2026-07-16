@@ -11,12 +11,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from cosmos_framework.utils.flags import DEVICE, INTERNAL, TRAINING
+from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.utils import log
 from cosmos_framework.utils.distributed import get_rank, sync_model_states
 from cosmos_framework.utils.easy_io import easy_io
-from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.utils.flags import DEVICE, INTERNAL, TRAINING
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 # For sequential decoding, CACHE_T is the number of frames to cache.
@@ -1026,7 +1026,11 @@ def _video_vae(
     for b in model.buffers():
         if not b.is_contiguous():
             b.data = b.data.contiguous()
-    sync_model_states(model)
+    # sync_model_states routes through the (NCCL) process group, which only
+    # verifies CUDA tensors. Skip for the CPU-offload build (VAE on CPU);
+    # single-rank has nothing to sync anyway. Multi-rank GPU builds unchanged.
+    if next(model.parameters()).device.type != "cpu":
+        sync_model_states(model)
 
     return model
 
@@ -1045,6 +1049,16 @@ class WanVAE:
     ):
         self.dtype = dtype
         self.device = device
+        # ---- VAE CPU offload anchor (4090 24GB) ----
+        # Env-gated (COSMOS3_VAE_CPU_OFFLOAD): materialize the VAE on CPU at build so
+        # it never co-resides with the DiT (fixes build OOM), and move it onto the
+        # inference device only inside encode()/decode() (evicted back after). Off by
+        # default; training/other paths are unaffected.
+        import os
+
+        self._vae_offload = bool(os.environ.get("COSMOS3_VAE_CPU_OFFLOAD", ""))
+        self._vae_gpu = torch.device(DEVICE)  # device the DiT runs on; VAE swaps onto it
+        build_device = "cpu" if self._vae_offload else device
 
         # Wan 2.2 mean and std values (48 dimensions)
         mean = [
@@ -1148,20 +1162,21 @@ class WanVAE:
             0.7744,
         ]
 
-        mean = torch.tensor(mean, dtype=dtype, device=device)  # [z_dim]
-        std = torch.tensor(std, dtype=dtype, device=device)  # [z_dim]
+        mean = torch.tensor(mean, dtype=dtype, device=build_device)  # [z_dim]
+        std = torch.tensor(std, dtype=dtype, device=build_device)  # [z_dim]
         self.scale = (mean, 1.0 / std)
 
         # init model
         self.model = _video_vae(
             pretrained_path=vae_pth,
             object_store_credential_path_pretrained=object_store_credential_path_pretrained,
-            device=device,
+            device=build_device,
             temporal_window=temporal_window,
             encode_exact_durations=encode_exact_durations,
         )
 
         self.model = self.model.eval().requires_grad_(False)
+        self._vae_cur = torch.device(build_device)
         self.is_amp = is_amp
         if not is_amp:
             self.model = self.model.to(dtype=dtype)
@@ -1171,6 +1186,19 @@ class WanVAE:
 
     def count_param(self) -> int:
         return sum(p.numel() for p in self.model.parameters())
+
+    def _vae_to(self, device) -> None:
+        """Move VAE weights + scale buffers to ``device``; no-op if already there.
+
+        Used only when VAE CPU offload is enabled (see ``__init__``). Synchronous;
+        the async two-stream variant is a follow-up (see docs/offload).
+        """
+        device = torch.device(device)
+        if device == getattr(self, "_vae_cur", device):
+            return
+        self.model = self.model.to(device)
+        self.scale = tuple(s.to(device) for s in self.scale)
+        self._vae_cur = device
 
     @torch.no_grad()
     def encode(self, videos: torch.Tensor) -> torch.Tensor:
@@ -1187,12 +1215,16 @@ class WanVAE:
         Returns:
             Tensor of shape ``[B, z_dim, T//4, H//16, W//16]``.
         """
+        if self._vae_offload:
+            self._vae_to(videos.device)  # pull VAE onto the input device (GPU) for encode
         in_dtype = videos.dtype
         with self.context:
             if not self.is_amp:
                 videos = videos.to(self.dtype)
             latent = self.model.encode(videos, self.scale)
         latent = latent.to(in_dtype)
+        if self._vae_offload:
+            self._vae_to("cpu")  # evict VAE → CPU, free GPU for the DiT denoise loop
         return latent
 
     @torch.no_grad()
@@ -1206,12 +1238,16 @@ class WanVAE:
         Returns:
             Tensor of shape ``[B, C, T, H, W]``.
         """
+        if self._vae_offload:
+            self._vae_to(zs.device)  # pull VAE onto the input device (GPU) for decode
         in_dtype = zs.dtype
         with self.context:
             if not self.is_amp:
                 zs = zs.to(self.dtype)
             video_recon = self.model.decode(zs, self.scale, clear_decoder_cache)
         video_recon = video_recon.to(in_dtype)
+        if self._vae_offload:
+            self._vae_to("cpu")  # evict VAE → CPU
         return video_recon
 
 

@@ -19,6 +19,7 @@ the caller can write them back into the cache outside the compile boundary.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -47,6 +48,16 @@ class MemoryValue(ABC):
         without importing the concrete subclass.
         """
         return True
+
+
+@dataclass
+class DiffusionKVCacheMemoryValue(MemoryValue):
+    """Read-only und K/V snapshot for diffusion gen-only denoising."""
+
+    und_k: torch.Tensor | None = None
+    und_v: torch.Tensor | None = None
+    frame_idx: int = 0
+    for_cuda_graphs: bool = False
 
 
 class MemoryState(ABC):
@@ -100,3 +111,80 @@ class MemoryState(ABC):
         visibility itself return ``False``.
         """
         return True
+
+
+class DiffusionKVCacheMemoryState(MemoryState):
+    """Cache understanding-tower K/V once, then reuse it for gen-only denoising.
+
+    A separate und-only prefill records the per-layer understanding K/V
+    tensors. Every denoise step, including step 0, then returns cached K/V and
+    marks the decoder as gen-only.
+    """
+
+    def __init__(self, num_layers: int, *, detach: bool = True) -> None:
+        self.num_layers = num_layers
+        self.detach = detach
+        self._und_k: list[torch.Tensor | None] = [None] * num_layers
+        self._und_v: list[torch.Tensor | None] = [None] * num_layers
+        self._initialized = False
+        self._device: torch.device | None = None
+        self._debug_und_input: torch.Tensor | None = None
+
+    def init(self, hidden_states: dict, device: torch.device) -> None:
+        debug_validate_und = os.environ.get("COSMOS3_REASONER_KVCACHE_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        reasoner_offloaded = os.environ.get("COSMOS3_REASONER_OFFLOAD", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if debug_validate_und and not (reasoner_offloaded and self.is_gen_only()):
+            und_len = int(hidden_states["_num_causal_tokens"])
+            und_input = hidden_states["causal_seq"][:und_len].detach()
+            if self._debug_und_input is None:
+                self._debug_und_input = und_input.clone()
+            else:
+                max_abs = (und_input - self._debug_und_input).abs().max().item()
+                if max_abs != 0.0:
+                    raise RuntimeError(
+                        "Diffusion KV-cache invariant failed: decoder understanding input changed "
+                        f"between denoise calls (max_abs={max_abs:.8g})."
+                    )
+        self._initialized = True
+        self._device = device
+
+    def read_for_layer(self, layer_idx: int) -> DiffusionKVCacheMemoryValue:
+        self._check_layer_idx(layer_idx)
+        return DiffusionKVCacheMemoryValue(
+            und_k=self._und_k[layer_idx],
+            und_v=self._und_v[layer_idx],
+            frame_idx=1 if self.is_gen_only() else 0,
+        )
+
+    def write_for_layer(self, layer_idx: int, kv_to_store: KVToStore) -> None:
+        self._check_layer_idx(layer_idx)
+        _gen_k, _gen_v, und_k, und_v = kv_to_store
+        if self.detach:
+            und_k = und_k.detach()
+            und_v = und_v.detach()
+        self._und_k[layer_idx] = und_k
+        self._und_v[layer_idx] = und_v
+
+    def is_gen_only(self) -> bool:
+        return self._initialized and all(k is not None and v is not None for k, v in zip(self._und_k, self._und_v))
+
+    def reset(self) -> None:
+        self._und_k = [None] * self.num_layers
+        self._und_v = [None] * self.num_layers
+        self._initialized = False
+        self._device = None
+        self._debug_und_input = None
+
+    def _check_layer_idx(self, layer_idx: int) -> None:
+        if not 0 <= layer_idx < self.num_layers:
+            raise IndexError(f"layer_idx {layer_idx} out of range for {self.num_layers} layers")

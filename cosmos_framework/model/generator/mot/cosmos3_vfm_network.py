@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import math
+import os
 from typing import List, Tuple
 
 import torch
@@ -9,6 +10,9 @@ from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
+from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
+from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
+from cosmos_framework.data.generator.sequence_packing.runtime import get_und_seq
 from cosmos_framework.model.generator.mot.attention import SplitInfo, build_packed_sequence
 from cosmos_framework.model.generator.mot.context_parallel_utils import (
     get_context_parallel_last_hidden_state,
@@ -17,8 +21,6 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
 from cosmos_framework.model.generator.mot.domain_aware_linear import DomainAwareLinear
 from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder
 from cosmos_framework.model.generator.utils.memory import MemoryState
-from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
-from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
 
 
 class Cosmos3VFMNetworkConfig(PretrainedConfig):
@@ -883,6 +885,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         self,
         packed_seq: PackedSequence,
         memory: MemoryState | None = None,
+        und_only: bool = False,
     ) -> dict:
         """
         Forward pass for Cosmos3VFMNetwork.
@@ -893,6 +896,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             memory: Optional MemoryState for persistent KV-cache memory
                 (AR inference or rolling-KV-cache training).  Built by
                 ``OmniMoTModel.build_memory_state()``.
+            und_only: Run only the text/reasoner pathway to populate diffusion K/V.
 
         Returns:
             dict with keys:
@@ -907,19 +911,33 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # This is intentional for proper batch norm / dropout behavior
         # assert self.training, "Cosmos3VFMNetwork only supports training mode"
 
-        packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
+        reasoner_is_offloaded = (
+            memory is not None
+            and memory.is_gen_only()
+            and os.environ.get("COSMOS3_REASONER_OFFLOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if reasoner_is_offloaded:
+            # The decoder ignores the und input after prefill and reads its
+            # per-layer und K/V from ``memory``.  Avoid touching the offloaded
+            # token embedding here; retain the original packed metadata and
+            # allocate only the generator input buffer on the generator device.
+            gen_anchor = self.language_model.model.norm_moe_gen.weight
+            packed_sequence = gen_anchor.new_zeros((packed_seq.sequence_length, self.hidden_size))
+            target_dtype = gen_anchor.dtype
+        else:
+            packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
 
         # encode vision tokens
         original_latent_shapes: List[Tuple[int, int, int]] | None = None
-        if self.config.vision_gen:
+        if self.config.vision_gen and not und_only:
             original_latent_shapes = self._encode_vision(packed_seq, packed_sequence, target_dtype)
 
         # encode action tokens
-        if self.config.action_gen:
+        if self.config.action_gen and not und_only:
             self._encode_action(packed_seq, packed_sequence, target_dtype)
 
         # encode sound tokens
-        if self.config.sound_gen:
+        if self.config.sound_gen and not und_only:
             self._encode_sound(packed_seq, packed_sequence, target_dtype)
 
         assert packed_seq.attn_modes is not None
@@ -1059,7 +1077,14 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             position_ids=packed_position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            und_only=und_only,
         )
+        if und_only:
+            output_dict = {"last_hidden_state": get_und_seq(packed_outputs)}
+            for lbl_metadata_key, lbl_metadata_value in lbl_metadata.items():
+                output_dict[f"lbl_metadata_{lbl_metadata_key}"] = lbl_metadata_value
+            return output_dict
+
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,
             parallel_dims=sequence_shard_parallel_dims,

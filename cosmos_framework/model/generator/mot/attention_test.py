@@ -8,11 +8,8 @@ import pytest
 import torch
 
 import cosmos_framework.model.generator.mot.attention as attention
-from cosmos_framework.model.attention.natten import NATTEN_SUPPORTED
-from cosmos_framework.model.generator.mot.attention import (
-    build_packed_sequence,
-)
 from cosmos_framework.data.generator.sequence_packing.runtime import (
+    from_mode_splits,
     get_all_seq,
     get_gen_seq,
     get_und_seq,
@@ -20,6 +17,11 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
     set_und_seq,
     zeros_like,
 )
+from cosmos_framework.model.attention.natten import NATTEN_SUPPORTED
+from cosmos_framework.model.generator.mot.attention import (
+    build_packed_sequence,
+)
+from cosmos_framework.model.generator.utils.memory import DiffusionKVCacheMemoryValue
 
 MAX_SEQ_LEN = 24
 SEQS_PER_BATCH = 4
@@ -355,6 +357,73 @@ def test_build_packed_sequence_rejects_flex():
             head_dim=8,
             num_layers=1,
         )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available() or not NATTEN_SUPPORTED, reason="CUDA attention backend required.")
+@pytest.mark.parametrize("impl", ["two_way", "three_way"])
+def test_dispatch_attention_with_diffusion_kv_cache_matches_standard_gen_path(impl: str):
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = 4
+    head_dim = 64
+
+    def make_pack(x):
+        input_pack, attention_meta, _ = build_packed_sequence(
+            impl,
+            packed_sequence=x,
+            attn_modes=["causal", "full"],
+            split_lens=[3, 4],
+            sample_lens=[7],
+            packed_und_token_indexes=torch.tensor([0, 1, 2], device=device, dtype=torch.long),
+            packed_gen_token_indexes=torch.tensor([3, 4, 5, 6], device=device, dtype=torch.long),
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_layers=1,
+            token_shapes=[(1, 4)],
+        )
+        return input_pack, attention_meta
+
+    torch.manual_seed(1234)
+    query_pack, attention_meta = make_pack(torch.randn(7, num_heads, head_dim, device=device, dtype=dtype))
+    key_pack, _ = make_pack(torch.randn(7, num_heads, head_dim, device=device, dtype=dtype))
+    value_pack, _ = make_pack(torch.randn(7, num_heads, head_dim, device=device, dtype=dtype))
+
+    with torch.no_grad():
+        standard_out, _ = attention.dispatch_attention(
+            query_pack,
+            key_pack,
+            value_pack,
+            attention_meta,
+            natten_metadata=None,
+        )
+        prefill_out, _ = attention.dispatch_attention_with_memory(
+            query_pack,
+            key_pack,
+            value_pack,
+            attention_meta,
+            natten_metadata=None,
+            memory_value=DiffusionKVCacheMemoryValue(),
+        )
+
+        query_gen_pack = from_mode_splits(get_und_seq(query_pack)[:0], get_gen_seq(query_pack), query_pack)
+        key_gen_pack = from_mode_splits(get_und_seq(key_pack)[:0], get_gen_seq(key_pack), key_pack)
+        value_gen_pack = from_mode_splits(get_und_seq(value_pack)[:0], get_gen_seq(value_pack), value_pack)
+        gen_only_out, _ = attention.dispatch_attention_with_memory(
+            query_gen_pack,
+            key_gen_pack,
+            value_gen_pack,
+            attention_meta,
+            natten_metadata=None,
+            memory_value=DiffusionKVCacheMemoryValue(
+                und_k=get_und_seq(key_pack).unsqueeze(0),
+                und_v=get_und_seq(value_pack).unsqueeze(0),
+            ),
+        )
+
+    torch.testing.assert_close(get_gen_seq(prefill_out), get_gen_seq(standard_out), atol=0, rtol=0)
+    torch.testing.assert_close(get_gen_seq(gen_only_out), get_gen_seq(standard_out), atol=1e-2, rtol=1e-2)
+    assert get_und_seq(gen_only_out).shape == (0, num_heads * head_dim)
 
 
 @pytest.mark.L0

@@ -307,6 +307,190 @@ def three_way_attention(
     return out_all
 
 
+def _get_cached_und_kv(memory_value: MemoryValue) -> tuple[torch.Tensor, torch.Tensor]:
+    und_k = getattr(memory_value, "und_k", None)
+    und_v = getattr(memory_value, "und_v", None)
+    if und_k is None or und_v is None:
+        raise ValueError("Diffusion KV cache is not populated for gen-only attention.")
+    if und_k.ndim == 4:
+        assert und_k.shape[0] == 1, f"Expected cached und_k batch dim 1, got {tuple(und_k.shape)}"
+        und_k = und_k.squeeze(0)
+    if und_v.ndim == 4:
+        assert und_v.shape[0] == 1, f"Expected cached und_v batch dim 1, got {tuple(und_v.shape)}"
+        und_v = und_v.squeeze(0)
+    assert und_k.ndim == 3 and und_v.ndim == 3, (
+        f"Expected cached und K/V to be [N,H,D], got und_k={tuple(und_k.shape)}, und_v={tuple(und_v.shape)}"
+    )
+    return und_k, und_v
+
+
+def two_way_attention_with_memory(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    memory_value: MemoryValue,
+    packed_key_states_normalized: SequencePack | None = None,
+) -> SequencePack:
+    """Gen-only two-way attention using cached understanding K/V."""
+
+    cached_und_k, cached_und_v = _get_cached_und_kv(memory_value)
+    full_q, full_q_offsets = get_full_only_seq(packed_query_states)
+    full_k, _ = get_full_only_seq(packed_key_states)
+    full_v, _ = get_full_only_seq(packed_value_states)
+    cached_und_k_offsets = packed_query_states["_causal_seq_offsets"]
+    sample_offsets = packed_query_states["sample_offsets"]
+
+    if packed_key_states_normalized is not None:
+        # The diffusion cache stores the und K form needed by gen cross-attn.
+        # The gen K portion still comes from the current step.
+        _, full_k_offsets = get_full_only_seq(packed_key_states_normalized)
+        del full_k_offsets
+
+    packed_key_for_gen = from_mode_splits(cached_und_k, full_k, packed_key_states)
+    packed_value_for_gen = from_mode_splits(cached_und_v, full_v, packed_value_states)
+
+    num_samples = sample_offsets.shape[0] - 1
+    use_dense = num_samples == 1 and not torch.is_grad_enabled()
+    full_varlen_kwargs = (
+        {}
+        if use_dense
+        else dict(
+            cumulative_seqlen_Q=full_q_offsets,
+            cumulative_seqlen_KV=sample_offsets,
+            max_seqlen_Q=packed_query_states["max_full_len"],
+            max_seqlen_KV=packed_query_states["max_sample_len"],
+        )
+    )
+
+    full_res = attention(
+        full_q.unsqueeze(0),
+        get_all_seq(packed_key_for_gen).unsqueeze(0),
+        get_all_seq(packed_value_for_gen).unsqueeze(0),
+        **full_varlen_kwargs,
+    )
+    full_out = full_res.squeeze(0).flatten(-2, -1)
+    causal_out = full_out.new_empty((0, full_out.shape[-1]))
+    return from_mode_splits(causal_out, full_out, packed_query_states)
+
+
+def three_way_attention_with_memory(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    attention_meta: SplitInfo | None,
+    memory_value: MemoryValue,
+    natten_metadata: dict | None = None,
+) -> SequencePack:
+    """Gen-only three-way attention using cached understanding K/V."""
+
+    cached_und_k, cached_und_v = _get_cached_und_kv(memory_value)
+    full_q, full_q_offsets = get_full_only_seq(packed_query_states)
+    full_k, full_k_offsets = get_full_only_seq(packed_key_states)
+    full_v, _ = get_full_only_seq(packed_value_states)
+    cached_und_k_offsets = packed_query_states["_causal_seq_offsets"]
+
+    if attention_meta is not None and attention_meta.null_action_supertokens:
+        full_v = full_v.clone()
+        starts = full_q_offsets[:-1].long()
+        null_positions = (
+            starts.unsqueeze(1) + torch.arange(attention_meta.num_action_tokens_per_supertoken, device=starts.device)
+        ).reshape(-1)
+        full_v[null_positions] = 0
+
+    if natten_metadata is None:
+        full_sa, full_sa_lse = attention(
+            full_q.unsqueeze(0),
+            full_k.unsqueeze(0),
+            full_v.unsqueeze(0),
+            cumulative_seqlen_Q=full_q_offsets,
+            cumulative_seqlen_KV=full_k_offsets,
+            max_seqlen_Q=packed_query_states["max_full_len"],
+            max_seqlen_KV=packed_query_states["max_full_len"],
+            return_lse=True,
+        )
+    else:
+        full_sa, full_sa_lse = multi_dimensional_attention_varlen(
+            full_q.unsqueeze(0),
+            full_k.unsqueeze(0),
+            full_v.unsqueeze(0),
+            metadata=natten_metadata,
+            return_lse=True,
+        )
+
+    full_ca, full_ca_lse = attention(
+        full_q.unsqueeze(0),
+        cached_und_k.unsqueeze(0),
+        cached_und_v.unsqueeze(0),
+        cumulative_seqlen_Q=full_q_offsets,
+        cumulative_seqlen_KV=cached_und_k_offsets,
+        max_seqlen_Q=packed_query_states["max_full_len"],
+        max_seqlen_KV=packed_query_states["max_causal_len"],
+        return_lse=True,
+    )
+
+    assert full_sa.shape == full_ca.shape
+    full_res, _ = merge_attentions(
+        outputs=[full_sa, full_ca], lse_tensors=[full_sa_lse, full_ca_lse], torch_compile=False
+    )
+    full_out = full_res.squeeze(0).flatten(-2, -1)
+    causal_out = full_out.new_empty((0, full_out.shape[-1]))
+    return from_mode_splits(causal_out, full_out, packed_query_states)
+
+
+def dispatch_attention_with_memory(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    attention_mask: SplitInfo,
+    natten_metadata: dict | None = None,
+    memory_value: MemoryValue | None = None,
+    packed_key_states_normalized: SequencePack | None = None,
+) -> tuple[SequencePack, KVToStore | None]:
+    """Dispatch attention with diffusion KV-cache support.
+
+    A memory value with empty K/V is a prefill sentinel: run the normal path so
+    the caller can record K/V. A populated memory value is the gen-only path.
+    """
+
+    if (
+        memory_value is None
+        or getattr(memory_value, "und_k", None) is None
+        or getattr(memory_value, "und_v", None) is None
+    ):
+        return dispatch_attention(
+            packed_query_states,
+            packed_key_states,
+            packed_value_states,
+            attention_mask,
+            natten_metadata=natten_metadata,
+            memory_value=None,
+            packed_key_states_normalized=packed_key_states_normalized,
+        )
+
+    if isinstance(attention_mask, SplitInfo) and attention_mask.control_stream_token_ranges is not None:
+        raise NotImplementedError("Diffusion KV-cache attention does not support multi-control transfer yet.")
+    if isinstance(attention_mask, SplitInfo) and attention_mask.is_three_way:
+        output = three_way_attention_with_memory(
+            packed_query_states,
+            packed_key_states,
+            packed_value_states,
+            attention_meta=attention_mask,
+            memory_value=memory_value,
+            natten_metadata=natten_metadata,
+        )
+    elif isinstance(attention_mask, SplitInfo):
+        output = two_way_attention_with_memory(
+            packed_query_states,
+            packed_key_states,
+            packed_value_states,
+            memory_value=memory_value,
+            packed_key_states_normalized=packed_key_states_normalized,
+        )
+    else:
+        raise TypeError(f"Unsupported attention metadata: {type(attention_mask)}")
+    return output, None
+
+
 def multi_control_two_way_attention(
     packed_query_states: SequencePack,
     packed_key_states: SequencePack,

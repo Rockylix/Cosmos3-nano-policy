@@ -1,10 +1,15 @@
 /assets
 /credentials
+/data
 /datasets
+/hdf_data
+/logs
 /outputs
 /tmp
 .cuda-name
 *.env
+*.nsys-rep
+*.sqlite
 
 # Default targets for docs/training.md Step 1 (data + VAE download) and
 # Step 2 (DCP conversion). Multi-GB; not for tracking.
