@@ -563,6 +563,10 @@ class PackedAttentionMoT(nn.Module):
         )
 
         self._apply_rotary_pos_emb = layer_types.apply_rotary_pos_emb
+        # Optional eager-only action-to-future attention capture used by the
+        # Nano Shared-Motion K112 experiment.  The hook is unset in normal
+        # training/inference, so the baseline attention path is unchanged.
+        self._nano_k112_attention_capture_callback: Any | None = None
         self.dispatch_attention_fn = dispatch_attention
         self.replicated_attention_io_local_head_o_proj = False
         self.replicated_attention_io_cp_mesh: Any | None = None
@@ -699,6 +703,24 @@ class PackedAttentionMoT(nn.Module):
             packed_key_states_normalized_: SequencePack | None = from_und_gen_splits(k_und_for_gen_, k_gen_, pack)
         else:
             packed_key_states_normalized_ = None
+
+        if self._nano_k112_attention_capture_callback is not None:
+            num_gen_tokens = int(pack["_num_full_tokens"])
+            cached_und_k = getattr(memory_value, "und_k_cached", None)
+            if cached_und_k is not None:
+                # InferenceTextKVMemoryValue stores [1,N_und,H_kv,D].
+                actual_und_k_for_gen = cached_und_k.squeeze(0)
+            else:
+                actual_und_k_for_gen = (
+                    k_und_for_gen_ if self.k_norm_und_for_gen is not None else k_und_
+                )
+            self._nano_k112_attention_capture_callback(
+                layer_index=self.layer_idx,
+                q_gen=q_gen_[:num_gen_tokens],
+                k_ar=actual_und_k_for_gen,
+                k_gen=k_gen_[:num_gen_tokens],
+                scaling=self.scaling,
+            )
 
         packed_attn_output, kv_to_store = self.dispatch_attention_fn(
             packed_query_states_,
@@ -1002,25 +1024,52 @@ def _impl_forward(
     # Derive gen_only once (outside compile) if using MemoryState
     memory_gen_only = memory.is_gen_only() if memory is not None else False
 
-    for i, decoder_layer in enumerate(self.layers):
-        # MemoryState: produce read-only MemoryValue for this layer (outside compile)
-        memory_value = memory.read_for_layer(i) if memory is not None else None
-
-        hidden_states, lbl_metadata_dict, kv_to_store = decoder_layer(
-            hidden_states,
-            attention_mask,
-            position_embeddings,
-            natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
-            memory_value=memory_value,
-            gen_only=memory_gen_only,
+    nano_k112_controller = getattr(self, "_nano_k112_sparse_controller", None)
+    if nano_k112_controller is not None:
+        nano_k112_controller.begin_stack(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            memory_gen_only=memory_gen_only,
+            natten_metadata_list=natten_metadata_list,
         )
 
-        # MemoryState: store K/V produced by this layer (outside compile)
-        if kv_to_store is not None and memory is not None:
-            memory.write_for_layer(i, kv_to_store)
+    try:
+        for i, decoder_layer in enumerate(self.layers):
+            # MemoryState: produce read-only MemoryValue for this layer (outside compile)
+            memory_value = memory.read_for_layer(i) if memory is not None else None
 
-        for pathway, lbl_metadata in lbl_metadata_dict.items():
-            lbl_metadata_all[pathway].append(lbl_metadata)
+            if nano_k112_controller is not None and nano_k112_controller.stack_active:
+                hidden_states, lbl_metadata_dict, kv_to_store = nano_k112_controller.run_layer(
+                    block=i,
+                    decoder_layer=decoder_layer,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    memory_value=memory_value,
+                    gen_only=memory_gen_only,
+                )
+            else:
+                hidden_states, lbl_metadata_dict, kv_to_store = decoder_layer(
+                    hidden_states,
+                    attention_mask,
+                    position_embeddings,
+                    natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
+                    memory_value=memory_value,
+                    gen_only=memory_gen_only,
+                )
+
+            # MemoryState stores K/V from the path that actually ran.
+            if kv_to_store is not None and memory is not None:
+                memory.write_for_layer(i, kv_to_store)
+
+            for pathway, lbl_metadata in lbl_metadata_dict.items():
+                lbl_metadata_all[pathway].append(lbl_metadata)
+    except Exception:
+        if nano_k112_controller is not None:
+            nano_k112_controller.abort_stack()
+        raise
+
+    if nano_k112_controller is not None and nano_k112_controller.stack_active:
+        hidden_states = nano_k112_controller.end_stack(hidden_states)
 
     # Dense models produce no metadata. MoE models produce one stacked entry per pathway.
     final_lbl_metadata = _stack_lbl_metadata(lbl_metadata_all)
