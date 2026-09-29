@@ -1,15 +1,27 @@
 {
   "release": "nano-offload-20260929",
-  "strategy": "dense",
-  "branch": "baseline",
   "source_base": "801bb20",
   "reasoner_instruction_cache": true,
   "reasoner_offload": true,
   "num_steps": 4,
-  "guidance": 3.0,
-  "shift": 5.0,
+  "guidance": 3,
+  "shift": 5,
   "compile_default": false,
   "cuda_graphs_default": false,
-  "entrypoint": "cosmos_framework.scripts.action_policy_server_robolab",
-  "note": "Release manifest, not an automatically loaded model configuration. Explicitly pass runtime flags."
+  "note": "Release manifest, not automatically loaded. Pass the entrypoint arguments explicitly.",
+  "branch": "experiment/toca-future",
+  "strategy": "toca",
+  "config": {
+    "schedule": "D/C/D/C",
+    "fresh_ratio": 0.25,
+    "depth_ratio": "0.25 * (1.5 - block / (blocks - 1))",
+    "age_weight": 0.25,
+    "spatial_bonus": 0,
+    "cfg_cache": "independent"
+  },
+  "entrypoint": "tools/benchmark_nano_cache_strategies.py",
+  "arguments": [
+    "--strategies",
+    "toca"
+  ]
 }
