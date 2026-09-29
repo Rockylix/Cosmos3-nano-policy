@@ -1,15 +1,23 @@
 {
   "release": "nano-offload-20260929",
-  "strategy": "dense",
-  "branch": "baseline",
   "source_base": "801bb20",
   "reasoner_instruction_cache": true,
   "reasoner_offload": true,
   "num_steps": 4,
-  "guidance": 3.0,
-  "shift": 5.0,
+  "guidance": 3,
+  "shift": 5,
   "compile_default": false,
   "cuda_graphs_default": false,
-  "entrypoint": "cosmos_framework.scripts.action_policy_server_robolab",
-  "note": "Release manifest, not an automatically loaded model configuration. Explicitly pass runtime flags."
+  "note": "Release manifest, not automatically loaded. Pass the entrypoint arguments explicitly.",
+  "branch": "experiment/real-robot-inference",
+  "strategy": "real_robot",
+  "config": {
+    "nano_version1_default_core": 64,
+    "nano_version1_default_stable": 120,
+    "controller_enabled_by_default": false
+  },
+  "entrypoint": "scripts/serve_cosmos_piper14_policy.py",
+  "arguments": [
+    "--nano-version1"
+  ]
 }
