@@ -1049,16 +1049,21 @@ class WanVAE:
     ):
         self.dtype = dtype
         self.device = device
-        # ---- VAE CPU offload anchor (4090 24GB) ----
-        # Env-gated (COSMOS3_VAE_CPU_OFFLOAD): materialize the VAE on CPU at build so
-        # it never co-resides with the DiT (fixes build OOM), and move it onto the
-        # inference device only inside encode()/decode() (evicted back after). Off by
-        # default; training/other paths are unaffected.
-        import os
-
-        self._vae_offload = bool(os.environ.get("COSMOS3_VAE_CPU_OFFLOAD", ""))
+        # ---- VAE placement anchors (4090 24GB) ----
+        # COSMOS3_VAE_CPU_OFFLOAD keeps the VAE on CPU and swaps it around
+        # encode/decode. COSMOS3_VAE_GPU_RESIDENT explicitly overrides that
+        # path: build/load the VAE directly on GPU and keep it resident.
+        gpu_resident = os.environ.get("COSMOS3_VAE_GPU_RESIDENT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._vae_offload = bool(os.environ.get("COSMOS3_VAE_CPU_OFFLOAD", "")) and not gpu_resident
         self._vae_gpu = torch.device(DEVICE)  # device the DiT runs on; VAE swaps onto it
         build_device = "cpu" if self._vae_offload else device
+        if gpu_resident:
+            log.info("WanVAE: COSMOS3_VAE_GPU_RESIDENT enabled; building VAE directly on GPU")
 
         # Wan 2.2 mean and std values (48 dimensions)
         mean = [

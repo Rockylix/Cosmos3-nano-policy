@@ -1,0 +1,77 @@
+dataset:
+  name: battery_assemble_piper14
+  root: /project/peilab/wam/physical_WM/data/battery_assemble
+  default_split: perfect
+  sim: false
+  compress: false
+  fps: 30
+  fps_source: /project/peilab/wam/physical_WM/data/battery_assemble/perfect_lerobot/meta/info.json
+  raw_hdf5_fps_attr: absent
+
+hdf5:
+  image_keys:
+    cam_high: /observations/images/cam_high
+    cam_left_wrist: /observations/images/cam_left_wrist
+    cam_right_wrist: /observations/images/cam_right_wrist
+  action_key: /action
+  qpos_key: /observations/qpos
+  qvel_key: /observations/qvel
+  effort_key: /observations/effort
+  base_action_key: /base_action
+
+image:
+  layout: THWC
+  color: RGB
+  dtype: uint8
+  height: 480
+  width: 640
+
+action:
+  dim: 14
+  type: absolute_joint_position_command
+  alignment: action_t_close_to_qpos_t_plus_1
+  gripper_unit: width
+  gripper_command_min: 0.0
+  gripper_command_max: 0.1
+  order:
+    - left_waist
+    - left_shoulder
+    - left_elbow
+    - left_forearm_roll
+    - left_wrist_angle
+    - left_wrist_rotate
+    - left_gripper
+    - right_waist
+    - right_shoulder
+    - right_elbow
+    - right_forearm_roll
+    - right_wrist_angle
+    - right_wrist_rotate
+    - right_gripper
+
+observation:
+  include_qpos: true
+  include_qvel: false
+  include_effort: false
+
+training:
+  observation_index: t
+  target_action_index: t
+  action_horizon: 32
+  history_frames: 1
+  stride: 1
+  ignore_base_action: true
+
+language:
+  source: lerobot_metadata
+  default_instruction: Assemble the mouse's battery.
+
+success:
+  source: directory_name
+  success_dirs:
+    - perfect
+
+missing_metadata:
+  gripper_unit: width_confirmed_from_deploy_scripts
+  fps: 30_confirmed_from_battery_lerobot_metadata
+  all_episode_action_qpos_alignment: next_confirmed_on_perfect_split

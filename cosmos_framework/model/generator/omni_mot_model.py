@@ -368,6 +368,9 @@ class OmniMoTModel(ImaginaireModel):
         )
         if not load_pretrained_diffusion_weights:
             log.info("Skipping diffusion pathway weights copying.")
+            self._maybe_pin_reasoner_cpu_master_tensors(self.net)
+            if self.config.ema.enabled:
+                self._maybe_pin_reasoner_cpu_master_tensors(self.net_ema)
             return
 
         # init_moe() copies the understanding-pathway weights into the generation
@@ -377,6 +380,9 @@ class OmniMoTModel(ImaginaireModel):
         if self.config.ema.enabled:
             self.net_ema.language_model.init_moe()
         log.info("Successfully copied understanding pathway weights to generation pathway.")
+        self._maybe_pin_reasoner_cpu_master_tensors(self.net)
+        if self.config.ema.enabled:
+            self._maybe_pin_reasoner_cpu_master_tensors(self.net_ema)
 
     @misc.timer("OmniMoTModel: set_up_model")
     def set_up_model(self):
@@ -729,8 +735,9 @@ class OmniMoTModel(ImaginaireModel):
 
         Generic layerwise offload keeps the full transformer stack on CPU. In
         reasoner-offload mode, GEN is instead resident on CUDA from model
-        construction onward while only the UND layer path is streamed. DCP
-        loading then writes directly into this mixed-device destination.
+        construction onward while the UND layer path and non-layer reasoner
+        bridge stay on CPU between policy chunks. DCP loading then writes
+        directly into this mixed-device destination.
 
         When ``allocate_empty`` is true, tensors that belong on the inference
         device receive fresh empty storage instead of copying their current
@@ -762,8 +769,12 @@ class OmniMoTModel(ImaginaireModel):
                 tensor.data = tensor.data.to(cuda_device, non_blocking=True)
 
         for name, parameter in net.named_parameters():
-            is_generator = self._reasoner_generator_parameter_target(name) == "cuda"
-            should_reside = id(parameter) not in layer_parameters or (reasoner_offload and is_generator)
+            placement = self._reasoner_generator_parameter_target(name)
+            is_generator = placement == "cuda"
+            is_reasoner_bridge = placement == "cpu" and id(parameter) not in layer_parameters
+            should_reside = (id(parameter) not in layer_parameters and not (reasoner_offload and is_reasoner_bridge)) or (
+                reasoner_offload and is_generator
+            )
             if should_reside:
                 _move_tensor(parameter)
             if is_generator:
@@ -773,8 +784,12 @@ class OmniMoTModel(ImaginaireModel):
                     generator_resident_cuda += size
 
         for name, buffer in net.named_buffers():
-            is_generator = self._reasoner_generator_parameter_target(name) == "cuda"
-            should_reside = id(buffer) not in layer_buffers or (reasoner_offload and is_generator)
+            placement = self._reasoner_generator_parameter_target(name)
+            is_generator = placement == "cuda"
+            is_reasoner_bridge = placement == "cpu" and id(buffer) not in layer_buffers
+            should_reside = (id(buffer) not in layer_buffers and not (reasoner_offload and is_reasoner_bridge)) or (
+                reasoner_offload and is_generator
+            )
             if should_reside:
                 _move_tensor(buffer)
             if is_generator:
@@ -797,9 +812,9 @@ class OmniMoTModel(ImaginaireModel):
     def _reasoner_generator_parameter_target(name: str) -> str | None:
         """Classify language-model tensors by UND/GEN ownership.
 
-        ``cpu`` identifies UND-owned tensors, but only UND tensors inside a
-        decoder layer are actually offloaded.  Non-layer UND bridge modules
-        stay CUDA-resident across chunks to avoid redundant transfers.
+        ``cpu`` identifies UND-owned tensors. Decoder-layer tensors are streamed
+        during prefill; non-layer UND bridge modules are restored before each
+        prefill and offloaded again once the branch KV caches become gen-only.
         """
 
         layer_prefix = "language_model.model.layers."
@@ -815,8 +830,71 @@ class OmniMoTModel(ImaginaireModel):
             return "cpu"
         return None
 
+    def _maybe_pin_reasoner_cpu_master_tensors(self, net: torch.nn.Module | None = None) -> None:
+        """Pin CPU-resident UND layer tensors used as repeated H2D masters."""
+
+        if not self._reasoner_offload_enabled() or not _env_enabled("COSMOS3_REASONER_PIN_CPU_MASTER"):
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("COSMOS3_REASONER_PIN_CPU_MASTER requires CUDA to allocate pinned host memory.")
+
+        target = net or self.net
+        layer_prefix = "language_model.model.layers."
+        pinned_bytes = 0
+        already_pinned_bytes = 0
+        skipped_bytes = 0
+
+        def _pin_tensor(tensor: torch.Tensor, name: str) -> int:
+            if tensor.device.type != "cpu":
+                return 0
+            if tensor.is_pinned():
+                return 0
+            try:
+                pinned = tensor.pin_memory()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Failed to pin UND CPU-master tensor storage. Check host RAM and memlock limits "
+                    f"before enabling COSMOS3_REASONER_PIN_CPU_MASTER; first failed tensor: {name}"
+                ) from exc
+            tensor.data = pinned
+            return tensor.numel() * tensor.element_size()
+
+        for name, parameter in target.named_parameters():
+            size = parameter.numel() * parameter.element_size()
+            should_pin = name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu"
+            if not should_pin:
+                continue
+            if parameter.device.type == "cpu" and parameter.is_pinned():
+                already_pinned_bytes += size
+                continue
+            if parameter.device.type != "cpu":
+                skipped_bytes += size
+                continue
+            pinned_bytes += _pin_tensor(parameter, name)
+
+        for name, buffer in target.named_buffers():
+            size = buffer.numel() * buffer.element_size()
+            should_pin = name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu"
+            if not should_pin:
+                continue
+            if buffer.device.type == "cpu" and buffer.is_pinned():
+                already_pinned_bytes += size
+                continue
+            if buffer.device.type != "cpu":
+                skipped_bytes += size
+                continue
+            pinned_bytes += _pin_tensor(buffer, name)
+
+        if pinned_bytes or already_pinned_bytes or skipped_bytes:
+            log.info(
+                "OmniMoTModel: UND CPU-master pinning complete; "
+                f"pinned={pinned_bytes / (1024**3):.2f} GiB "
+                f"already_pinned={already_pinned_bytes / (1024**3):.2f} GiB "
+                f"skipped_non_cpu={skipped_bytes / (1024**3):.2f} GiB"
+            )
+
     def _offload_reasoner_and_pin_generator(self, net: torch.nn.Module | None = None) -> None:
-        """Keep GEN and reasoner bridge modules resident; offload UND layer tensors."""
+        """Keep GEN resident and offload all UND tensors after cache prefill."""
 
         if self._reasoner_offload_complete:
             return
@@ -840,19 +918,18 @@ class OmniMoTModel(ImaginaireModel):
             return size
 
         # UND layer tensors should already be back on CPU after streamed
-        # prefill.  Keep the 2.32 GiB non-layer reasoner bridge (embeddings,
-        # visual encoder, final norm/head) on CUDA: every action chunk needs
-        # it for prefill, and evicting/restoring it adds host pressure and a
-        # redundant D2H/H2D cycle without reducing prefill's CUDA peak.
-        layer_prefix = "language_model.model.layers."
+        # prefill. The bridge (embeddings, visual encoder, final norm/head) is
+        # also evicted here: it is not used by the cached GEN-only denoise
+        # forwards, while keeping it resident starves the co-located simulator.
         for name, parameter in target.named_parameters():
-            if name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu":
+            if self._reasoner_generator_parameter_target(name) == "cpu":
                 moved_to_cpu += _move_tensor(parameter, cpu_device)
         for name, buffer in target.named_buffers():
-            if name.startswith(layer_prefix) and self._reasoner_generator_parameter_target(name) == "cpu":
+            if self._reasoner_generator_parameter_target(name) == "cpu":
                 moved_to_cpu += _move_tensor(buffer, cpu_device)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        if _env_enabled("COSMOS3_REASONER_EMPTY_CACHE"):
+            torch.cuda.empty_cache()
 
         for name, parameter in target.named_parameters():
             if self._reasoner_generator_parameter_target(name) == "cuda":
@@ -872,7 +949,7 @@ class OmniMoTModel(ImaginaireModel):
         allocated_gib = torch.cuda.memory_allocated() / (1024**3)
         reserved_gib = torch.cuda.memory_reserved() / (1024**3)
         log.info(
-            "OmniMoTModel: UND layer offload finalized after prefill; "
+            "OmniMoTModel: UND and reasoner bridge offload finalized after prefill; "
             f"moved_to_cpu={moved_to_cpu / (1024**3):.2f} GiB "
             f"generator_to_cuda={moved_to_cuda / (1024**3):.2f} GiB "
             f"generator_resident_cuda={generator_resident_cuda / (1024**3):.2f} GiB "
@@ -880,7 +957,7 @@ class OmniMoTModel(ImaginaireModel):
         )
 
     def _prepare_reasoner_prefill(self, net: torch.nn.Module | None = None) -> None:
-        """Prepare a new chunk while leaving an already-resident generator on CUDA."""
+        """Restore the reasoner bridge for prefill while keeping GEN resident."""
 
         if not self._reasoner_offload_enabled():
             return
@@ -890,24 +967,31 @@ class OmniMoTModel(ImaginaireModel):
         cuda_device = torch.device(DEVICE)
         reasoner_bridge_total = 0
         reasoner_bridge_cuda = 0
+        reasoner_bridge_to_cuda = 0
         layer_prefix = "language_model.model.layers."
+
+        def _restore_bridge_tensor(tensor: torch.Tensor) -> int:
+            if tensor.device.type == cuda_device.type and (
+                cuda_device.index is None or tensor.device.index == cuda_device.index
+            ):
+                return 0
+            size = tensor.numel() * tensor.element_size()
+            tensor.data = tensor.data.to(device=cuda_device, non_blocking=True)
+            return size
+
         for name, parameter in target.named_parameters():
             if self._reasoner_generator_parameter_target(name) == "cpu" and not name.startswith(layer_prefix):
                 size = parameter.numel() * parameter.element_size()
                 reasoner_bridge_total += size
-                if parameter.device.type == cuda_device.type:
-                    reasoner_bridge_cuda += size
+                reasoner_bridge_to_cuda += _restore_bridge_tensor(parameter)
+                reasoner_bridge_cuda += size
         for name, buffer in target.named_buffers():
             if self._reasoner_generator_parameter_target(name) == "cpu" and not name.startswith(layer_prefix):
                 size = buffer.numel() * buffer.element_size()
                 reasoner_bridge_total += size
-                if buffer.device.type == cuda_device.type:
-                    reasoner_bridge_cuda += size
-        if reasoner_bridge_cuda != reasoner_bridge_total:
-            raise RuntimeError(
-                "Reasoner bridge modules must remain CUDA-resident between action chunks: "
-                f"{reasoner_bridge_cuda / (1024**3):.2f}/{reasoner_bridge_total / (1024**3):.2f} GiB on CUDA"
-            )
+                reasoner_bridge_to_cuda += _restore_bridge_tensor(buffer)
+                reasoner_bridge_cuda += size
+        torch.cuda.synchronize()
 
         generator_total = 0
         generator_remained_cuda = 0
@@ -929,7 +1013,8 @@ class OmniMoTModel(ImaginaireModel):
             "OmniMoTModel: prepared reasoner prefill for new chunk; "
             f"generator_remained_cuda={generator_remained_cuda / (1024**3):.2f}/"
             f"{generator_total / (1024**3):.2f} GiB "
-            f"reasoner_bridge_remained_cuda={reasoner_bridge_cuda / (1024**3):.2f}/"
+            f"reasoner_bridge_to_cuda={reasoner_bridge_to_cuda / (1024**3):.2f} GiB "
+            f"reasoner_bridge_cuda={reasoner_bridge_cuda / (1024**3):.2f}/"
             f"{reasoner_bridge_total / (1024**3):.2f} GiB"
         )
 
@@ -2715,14 +2800,36 @@ class OmniMoTModel(ImaginaireModel):
             _dp_shard_group = None
             _align_device = None
 
-        # A previous request may have offloaded the reasoner tower after its
-        # diffusion prefill. Restore the non-layer reasoner tensors once here;
-        # streamed decoder layers are restored immediately before each layer
-        # runs and selectively evicted again by UnifiedMoT.
-        self._prepare_reasoner_prefill(net)
+        # Policy serving can reuse UND K/V across chunks when the instruction
+        # token sequence is unchanged.  The cache owns only the two per-layer
+        # MemoryState objects; current vision/action tokens remain fresh GEN
+        # inputs on every request.
+        persistent_policy_cache = _env_enabled("COSMOS3_POLICY_REASONER_CACHE")
 
-        cond_memory = self.build_inference_memory_state(net=net)
-        uncond_memory = self.build_inference_memory_state(net=net)
+        def _token_cache_key(tokens: list[list[int]]) -> tuple[tuple[int, ...], ...]:
+            return tuple(tuple(int(token) for token in sample) for sample in tokens)
+
+        memory_cache_key = (
+            _token_cache_key(cond_tokens),
+            _token_cache_key(uncond_tokens) if guidance != 1.0 else (),
+            bool(skip_text_tokens_for_cfg),
+        )
+        cached = getattr(self, "_policy_reasoner_memory_cache", None) if persistent_policy_cache else None
+        if cached is not None and cached[0] == memory_cache_key:
+            cond_memory, uncond_memory = cached[1], cached[2]
+        else:
+            cond_memory = self.build_inference_memory_state(net=net)
+            uncond_memory = self.build_inference_memory_state(net=net)
+            if persistent_policy_cache:
+                self._policy_reasoner_memory_cache = (memory_cache_key, cond_memory, uncond_memory)
+
+        # Restore the reasoner bridge only on a cache miss.  Once both caches
+        # are gen-only, later policy chunks never reload UND weights.
+        needs_prefill = cond_memory is None or not cond_memory.is_gen_only()
+        if guidance != 1.0:
+            needs_prefill = needs_prefill or uncond_memory is None or not uncond_memory.is_gen_only()
+        if needs_prefill:
+            self._prepare_reasoner_prefill(net)
 
         def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
             # len(noise_x) == B, noise_x[i] is shape (D)
@@ -3811,6 +3918,7 @@ class OmniMoTModel(ImaginaireModel):
             )
 
         ret: _IncompatibleKeys = net.load_state_dict(state_dict, strict=False, assign=False)
+        self._maybe_pin_reasoner_cpu_master_tensors(net)
 
         if self.config.exclude_reasoner_weights_from_checkpoint:
             missing_keys = [k for k in ret.missing_keys if not _is_reasoner_state_dict_key(k)]

@@ -239,7 +239,7 @@ def test_initial_reasoner_offload_places_generator_on_cuda(monkeypatch: pytest.M
         placement = model._reasoner_generator_parameter_target(name)
         if placement == "cuda":
             assert parameter.device.type == "cuda", name
-        elif name.startswith("language_model.model.layers."):
+        elif placement == "cpu":
             assert parameter.device.type == "cpu", name
         else:
             assert parameter.device.type == "cuda", name
@@ -274,12 +274,11 @@ def test_policy_chunk_switches_generator_and_reasoner_placement(monkeypatch: pyt
     model._reasoner_offload_complete = True
     monkeypatch.setenv("COSMOS3_REASONER_OFFLOAD", "1")
 
-    # Recreate the end-of-chunk state: UND layers on CPU while GEN and the
-    # non-layer reasoner bridge remain on CUDA.
+    # Recreate the end-of-chunk state: all UND tensors are on CPU while GEN
+    # and unclassified non-layer generation helpers remain on CUDA.
     for name, parameter in net.named_parameters():
-        if model._reasoner_generator_parameter_target(name) == "cuda" or not name.startswith(
-            "language_model.model.layers."
-        ):
+        placement = model._reasoner_generator_parameter_target(name)
+        if placement == "cuda" or placement is None:
             parameter.data = parameter.data.cuda()
 
     model._prepare_reasoner_prefill(net)
@@ -297,7 +296,41 @@ def test_policy_chunk_switches_generator_and_reasoner_placement(monkeypatch: pyt
         placement = model._reasoner_generator_parameter_target(name)
         if placement == "cuda":
             assert parameter.device.type == "cuda", name
-        elif placement == "cpu" and name.startswith("language_model.model.layers."):
-            assert parameter.device.type == "cpu", name
         elif placement == "cpu":
-            assert parameter.device.type == "cuda", name
+            assert parameter.device.type == "cpu", name
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required to allocate pinned host memory.")
+def test_reasoner_offload_can_pin_und_cpu_master_tensors(monkeypatch: pytest.MonkeyPatch):
+    class TinyLayer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4, bias=False)
+            self.q_proj_moe_gen = torch.nn.Linear(4, 4, bias=False)
+
+    net = torch.nn.Module()
+    net.language_model = torch.nn.Module()
+    net.language_model.model = torch.nn.Module()
+    net.language_model.model.layers = torch.nn.ModuleList([TinyLayer()])
+    net.language_model.model.embed_tokens = torch.nn.Embedding(8, 4)
+    net.language_model.model.norm = torch.nn.LayerNorm(4)
+    net.language_model.model.norm_moe_gen = torch.nn.LayerNorm(4)
+    net.language_model.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    model = OmniMoTModel.__new__(OmniMoTModel)
+    torch.nn.Module.__init__(model)
+    monkeypatch.setenv("COSMOS3_REASONER_OFFLOAD", "1")
+    monkeypatch.setenv("COSMOS3_REASONER_PIN_CPU_MASTER", "1")
+
+    net.language_model.model.layers[0].q_proj_moe_gen.weight.data = (
+        net.language_model.model.layers[0].q_proj_moe_gen.weight.data.cuda()
+    )
+    net.language_model.model.embed_tokens.weight.data = net.language_model.model.embed_tokens.weight.data.cuda()
+
+    model._maybe_pin_reasoner_cpu_master_tensors(net)
+
+    assert net.language_model.model.layers[0].q_proj.weight.device.type == "cpu"
+    assert net.language_model.model.layers[0].q_proj.weight.is_pinned()
+    assert net.language_model.model.layers[0].q_proj_moe_gen.weight.device.type == "cuda"
+    assert net.language_model.model.embed_tokens.weight.device.type == "cuda"

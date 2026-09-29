@@ -531,6 +531,9 @@ class PackedAttentionMoT(nn.Module):
         )
 
         self._apply_rotary_pos_emb = layer_types.apply_rotary_pos_emb
+        # Optional eager-only action-to-future Q/K capture.  It remains unset
+        # on the normal Nano path and is installed request-locally by Piper.
+        self._k112_attention_capture_callback: Any | None = None
         self.dispatch_attention_fn = dispatch_attention
         self.replicated_attention_io_local_head_o_proj = False
         self.replicated_attention_io_cp_mesh: Any | None = None
@@ -722,6 +725,23 @@ class PackedAttentionMoT(nn.Module):
         packed_query_states_ = from_und_gen_splits(q_und_, q_gen_, pack)  # [N_und+N_gen,num_heads,head_dim]
         packed_key_states_ = from_und_gen_splits(k_und_, k_gen_, pack)  # [N_und+N_gen,num_kv_heads,head_dim]
         packed_value_states_ = from_und_gen_splits(v_und, v_gen, pack)  # [N_und+N_gen,num_kv_heads,head_dim]
+
+        if self._k112_attention_capture_callback is not None:
+            num_gen_tokens = int(pack["_num_full_tokens"])
+            cached_und_k = getattr(memory_value, "und_k", None)
+            if cached_und_k is not None:
+                actual_und_k_for_gen = cached_und_k.squeeze(0)
+            else:
+                actual_und_k_for_gen = (
+                    k_und_for_gen_ if self.k_norm_und_for_gen is not None else k_und_
+                )
+            self._k112_attention_capture_callback(
+                layer_index=self.layer_idx,
+                q_gen=q_gen_[:num_gen_tokens],
+                k_ar=actual_und_k_for_gen,
+                k_gen=k_gen_[:num_gen_tokens],
+                scaling=self.scaling,
+            )
 
         packed_attn_output, kv_to_store = self.dispatch_attention_fn(
             packed_query_states_,
@@ -997,9 +1017,14 @@ def _impl_forward(
     _reasoner_offload = _offload_env_enabled("COSMOS3_REASONER_OFFLOAD")
     _layer_offload = _offload_env_enabled("COSMOS3_LAYER_OFFLOAD") or _reasoner_offload
 
-    def _move_layer_path(layer: torch.nn.Module, *, generator: bool, target: torch.device | str) -> int:
+    def _stage_layer_path_to_cuda(
+        layer: torch.nn.Module, *, generator: bool, target: torch.device | str
+    ) -> tuple[int, list[tuple[torch.Tensor, torch.Tensor]]]:
         target_device = torch.device(target)
+        if target_device.type != "cuda":
+            raise ValueError(f"Layer staging target must be CUDA, got {target_device}.")
         moved_bytes = 0
+        backups: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         def _is_on_target(tensor: torch.Tensor) -> bool:
             return tensor.device.type == target_device.type and (
@@ -1008,13 +1033,24 @@ def _impl_forward(
 
         for name, parameter in layer.named_parameters():
             if ("_moe_gen" in name) == generator and not _is_on_target(parameter):
+                cpu_master = parameter.data
                 moved_bytes += parameter.numel() * parameter.element_size()
-                parameter.data = parameter.data.to(target_device, non_blocking=True)
+                parameter.data = cpu_master.to(target_device, non_blocking=False)
+                backups.append((parameter, cpu_master))
         for name, buffer in layer.named_buffers():
             if ("_moe_gen" in name) == generator and not _is_on_target(buffer):
+                cpu_master = buffer.data
                 moved_bytes += buffer.numel() * buffer.element_size()
-                buffer.data = buffer.data.to(target_device, non_blocking=True)
-        return moved_bytes
+                buffer.data = cpu_master.to(target_device, non_blocking=False)
+                backups.append((buffer, cpu_master))
+        return moved_bytes, backups
+
+    def _restore_layer_path_from_cpu_master(backups: list[tuple[torch.Tensor, torch.Tensor]]) -> int:
+        restored_bytes = 0
+        for tensor, cpu_master in reversed(backups):
+            restored_bytes += cpu_master.numel() * cpu_master.element_size()
+            tensor.data = cpu_master
+        return restored_bytes
 
     # --- MemoryState: per-step init (outside compile) ---
     if memory is not None:
@@ -1035,6 +1071,7 @@ def _impl_forward(
     reasoner_d2h_bytes = 0
     reasoner_h2d_layers = 0
     reasoner_d2h_layers = 0
+    reasoner_restore_layers = 0
     if _stream_reasoner_layers:
         for layer_idx, layer in enumerate(self.layers):
             for name, parameter in layer.named_parameters():
@@ -1054,9 +1091,21 @@ def _impl_forward(
                     if buffer.device.type == "cuda":
                         generator_cuda_bytes += size
 
+    version1_controller = getattr(self, "_k112_sparse_controller", None)
+    if version1_controller is not None:
+        version1_controller.begin_stack(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            memory_gen_only=memory_gen_only,
+            natten_metadata_list=natten_metadata_list,
+        )
+
     for i, decoder_layer in enumerate(self.layers):
+        reasoner_cpu_backups: list[tuple[torch.Tensor, torch.Tensor]] = []
         if _stream_reasoner_layers:
-            moved_bytes = _move_layer_path(decoder_layer, generator=False, target=device)
+            moved_bytes, reasoner_cpu_backups = _stage_layer_path_to_cuda(
+                decoder_layer, generator=False, target=device
+            )
             reasoner_h2d_bytes += moved_bytes
             reasoner_h2d_layers += int(moved_bytes > 0)
         elif _stream_complete_layers:
@@ -1065,20 +1114,34 @@ def _impl_forward(
         # MemoryState: produce read-only MemoryValue for this layer (outside compile)
         memory_value = memory.read_for_layer(i) if memory is not None else None
 
-        hidden_states, lbl_metadata_dict, kv_to_store = decoder_layer(
-            hidden_states,
-            attention_mask,
-            position_embeddings,
-            natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
-            memory_value=memory_value,
-            gen_only=memory_gen_only,
-            und_only=und_only,
-        )
+        try:
+            if version1_controller is not None and version1_controller.stack_active:
+                hidden_states, lbl_metadata_dict, kv_to_store = version1_controller.run_layer(
+                    block=i,
+                    decoder_layer=decoder_layer,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    memory_value=memory_value,
+                    gen_only=memory_gen_only,
+                )
+            else:
+                hidden_states, lbl_metadata_dict, kv_to_store = decoder_layer(
+                    hidden_states,
+                    attention_mask,
+                    position_embeddings,
+                    natten_metadata=None if natten_metadata_list is None else natten_metadata_list[i],
+                    memory_value=memory_value,
+                    gen_only=memory_gen_only,
+                    und_only=und_only,
+                )
+        except Exception:
+            if version1_controller is not None:
+                version1_controller.abort_stack()
+            raise
 
         if _stream_reasoner_layers:
-            moved_bytes = _move_layer_path(decoder_layer, generator=False, target="cpu")
-            reasoner_d2h_bytes += moved_bytes
-            reasoner_d2h_layers += int(moved_bytes > 0)
+            restored_bytes = _restore_layer_path_from_cpu_master(reasoner_cpu_backups)
+            reasoner_restore_layers += int(restored_bytes > 0)
         elif _stream_complete_layers:
             # During prefill, evict the complete mixed layer.  This guarantees
             # that each policy chunk has a true phase boundary: generator on
@@ -1092,6 +1155,9 @@ def _impl_forward(
 
         for pathway, lbl_metadata in lbl_metadata_dict.items():
             lbl_metadata_all[pathway].append(lbl_metadata)
+
+    if version1_controller is not None and version1_controller.stack_active:
+        hidden_states = version1_controller.end_stack(hidden_states)
 
     if _stream_reasoner_layers:
         for layer_idx, layer in enumerate(self.layers):
@@ -1115,6 +1181,7 @@ def _impl_forward(
             f"reasoner_h2d={reasoner_h2d_bytes / (1024**3):.2f} GiB "
             f"reasoner_d2h_layers={reasoner_d2h_layers} "
             f"reasoner_d2h={reasoner_d2h_bytes / (1024**3):.2f} GiB; "
+            f"reasoner_restore_layers={reasoner_restore_layers}; "
             f"generator placement unchanged with "
             f"{generator_cuda_bytes / (1024**3):.2f}/{generator_total_bytes / (1024**3):.2f} GiB on CUDA"
         )

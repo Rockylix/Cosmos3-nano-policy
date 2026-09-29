@@ -604,6 +604,27 @@ class ActionTransformPipeline:
         # 1. Resize + reflection-pad spatial dimensions to the closest predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
         data_dict = self.video_resize(data_dict, resolution)
 
+        # Condition-only VAE inference spatially transforms the sole clean
+        # frame, then restores the logical temporal length as a zero-copy view.
+        # Subsequent prompt metadata and sequence planning therefore observe
+        # exactly the same [C,T,H,W] shape as the standard full-video path.
+        temporal_expand = data_dict.pop("inference_temporal_expand_after_resize", None)
+        if temporal_expand is not None:
+            temporal_expand = int(temporal_expand)
+            video = data_dict.get("video")
+            if not isinstance(video, torch.Tensor) or video.ndim != 4 or video.shape[1] != 1:
+                shape = None if not isinstance(video, torch.Tensor) else tuple(video.shape)
+                raise ValueError(
+                    "inference_temporal_expand_after_resize requires video shape [C,1,H,W], "
+                    f"got {shape}"
+                )
+            if temporal_expand < 1:
+                raise ValueError(
+                    "inference_temporal_expand_after_resize must be positive, "
+                    f"got {temporal_expand}"
+                )
+            data_dict["video"] = video.expand(-1, temporal_expand, -1, -1)
+
         # 2. Format the caption as structured JSON when requested; otherwise run the legacy string appenders.
         if self.prompt_json_formatter is not None:
             data_dict = self.prompt_json_formatter(data_dict)

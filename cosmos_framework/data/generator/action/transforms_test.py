@@ -83,6 +83,33 @@ def test_video_padding_round_trips_to_unpadded_region() -> None:
 
 
 @pytest.mark.L0
+def test_condition_only_temporal_expand_matches_full_video_transform() -> None:
+    pipeline = ActionTransformPipeline(tokenizer_config=None, max_action_dim=4)
+    frame = torch.arange(3 * 4 * 5, dtype=torch.uint8).reshape(3, 1, 4, 5)
+    action = torch.zeros(5, 2)
+    common = {
+        "ai_caption": "Move the arm.",
+        "action": action,
+        "conditioning_fps": torch.tensor(5),
+        "mode": "policy",
+        "domain_id": torch.tensor(0),
+        "viewpoint": "concat_view",
+    }
+
+    fast = pipeline(
+        {**common, "video": frame.clone(), "inference_temporal_expand_after_resize": 6},
+        resolution="256",
+    )
+    standard = pipeline({**common, "video": frame.repeat(1, 6, 1, 1)}, resolution="256")
+
+    assert fast["video"].shape == standard["video"].shape
+    assert fast["ai_caption"] == standard["ai_caption"]
+    assert fast["sequence_plan"].as_dict() == standard["sequence_plan"].as_dict()
+    torch.testing.assert_close(fast["video"], standard["video"])
+    assert "inference_temporal_expand_after_resize" not in fast
+
+
+@pytest.mark.L0
 def test_action_prompt_json_formatter_drops_empty_fields() -> None:
     formatter = ActionPromptJsonFormatter()
     video = torch.zeros(3, 12, 480, 640)  # [C,T,H,W]

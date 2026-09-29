@@ -1,0 +1,13 @@
+{
+  "local_k": 58,
+  "global_k": 72,
+  "global_blocks": [17, 35],
+  "update_blocks": [18, 25, 31],
+  "prune_blocks": [13, 19, 26, 32],
+  "low_change_cap": 331,
+  "dynamic_threshold": 0.986,
+  "keep_ratio": 0.9,
+  "ema_beta": 0.2,
+  "min_observation_tokens": 184,
+  "target_average_future_retention": 0.5722222222222222
+}

@@ -223,3 +223,14 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local inference assets and generated experiment data; keep docs tracked.
+/experiments/
+/experiment/
+/hdf_data/
+/checkpoints/
+/cosmos_battery/
+/.worktrees/
+/runtime/
+*.nsys-rep
+*.sqlite
