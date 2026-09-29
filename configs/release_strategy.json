@@ -1,15 +1,27 @@
 {
   "release": "nano-offload-20260929",
-  "strategy": "dense",
-  "branch": "baseline",
   "source_base": "801bb20",
   "reasoner_instruction_cache": true,
   "reasoner_offload": true,
   "num_steps": 4,
-  "guidance": 3.0,
-  "shift": 5.0,
+  "guidance": 3,
+  "shift": 5,
   "compile_default": false,
   "cuda_graphs_default": false,
-  "entrypoint": "cosmos_framework.scripts.action_policy_server_robolab",
-  "note": "Release manifest, not an automatically loaded model configuration. Explicitly pass runtime flags."
+  "note": "Release manifest, not automatically loaded. Pass the entrypoint arguments explicitly.",
+  "branch": "experiment/specprune-future",
+  "strategy": "specprune",
+  "config": {
+    "config": "configs/specprune_asi_k184_budget.json",
+    "local_k": 58,
+    "global_k": 72,
+    "min_observation_tokens": 184,
+    "velocity_cache": false,
+    "recovery": "exit hidden before heads"
+  },
+  "entrypoint": "cosmos_framework.scripts.action_policy_server_robolab_specprune",
+  "arguments": [
+    "--mode",
+    "specprune"
+  ]
 }
